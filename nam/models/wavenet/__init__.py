@@ -28,6 +28,7 @@ class WaveNet(_BaseNet, _ImportsWeights):
     ):
         super().__init__(sample_rate=sample_rate)
         self._net = wavenet
+        self._external_slimming_control = False
 
     @classmethod
     def parse_config(cls, config: _Dict) -> _Dict:
@@ -62,7 +63,10 @@ class WaveNet(_BaseNet, _ImportsWeights):
             raise ValueError("WaveNet does not support kwargs")
         if x.ndim == 2:
             x = x[:, None, :]
-        if self.training and self._net.is_slimmable():
+        if self._external_slimming_control:
+            # Slimming is managed externally (e.g. dual-optimizer training step)
+            y = self._net(x)
+        elif self.training and self._net.is_slimmable():
             with self._net.context_adjust_to_random():
                 y = self._net(x)
         else:

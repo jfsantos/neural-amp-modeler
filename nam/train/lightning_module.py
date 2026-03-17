@@ -190,6 +190,8 @@ class LightningModule(_pl.LightningModule, _InitializableFromConfig):
         optimizer_config: _Optional[dict] = None,
         scheduler_config: _Optional[dict] = None,
         loss_config: _Optional[LossConfig] = None,
+        optimizer_small_config: _Optional[dict] = None,
+        freeze_small: _Optional[dict] = None,
     ):
         """
         :param scheduler_config: contains
@@ -200,10 +202,22 @@ class LightningModule(_pl.LightningModule, _InitializableFromConfig):
             * "interval" ("epoch" of "step")
             * "frequency" (int)
             * "monitor" (str)
+        :param optimizer_small_config: Optimizer kwargs for the small model step
+            in dual-optimizer slimmable training. If None, uses the main optimizer
+            config for both. Only used when the net is a slimmable WaveNet.
+        :param freeze_small: Controls when to freeze the small model and switch
+            to training the large model. Supported keys:
+            - "after_epoch" (int): Hard cutoff — freeze after this epoch.
+            - "patience" (int): Freeze after this many epochs without improvement.
+            - "min_delta" (float): Minimum improvement to reset patience counter
+              (default: 0.0).
+            When both "after_epoch" and "patience" are set, whichever triggers
+            first wins. If None, both models are trained every step (no phasing).
         """
         super().__init__()
         self._net = net
         self._optimizer_config = {} if optimizer_config is None else optimizer_config
+        self._optimizer_small_config = optimizer_small_config
         self._scheduler_config = scheduler_config
         self._loss_config = LossConfig() if loss_config is None else loss_config
         self._mrstft = None  # Multi-resolution short-time Fourier transform loss
@@ -211,6 +225,38 @@ class LightningModule(_pl.LightningModule, _InitializableFromConfig):
         # Keeping it on-device is preferable, but if that fails, then remember to drop
         # it to cpu from then on.
         self._mrstft_device: _Optional[_torch.device] = None
+
+        # Freeze-small config
+        self._freeze_small_config = freeze_small
+        self._freeze_small_after_epoch: _Optional[int] = None
+        self._freeze_small_patience: _Optional[int] = None
+        self._freeze_small_min_delta: float = 0.0
+        if freeze_small is not None:
+            self._freeze_small_after_epoch = freeze_small.get("after_epoch")
+            self._freeze_small_patience = freeze_small.get("patience")
+            self._freeze_small_min_delta = freeze_small.get("min_delta", 0.0)
+
+        # Patience tracking state (reset in on_train_start if needed)
+        self._small_best_loss: _Optional[float] = None
+        self._small_patience_counter: int = 0
+        self._small_frozen: bool = False
+        self._small_frozen_at_epoch: _Optional[int] = None
+
+        # Dual-optimizer mode for slimmable WaveNet
+        self._dual_optimizer = self._is_dual_optimizer_applicable()
+        if self._dual_optimizer:
+            self.automatic_optimization = False
+            # Tell the WaveNet wrapper that slimming is controlled externally
+            self._net._external_slimming_control = True
+
+    def _is_dual_optimizer_applicable(self) -> bool:
+        """Check if the net is a slimmable WaveNet that supports dual optimizers."""
+        if not isinstance(self._net, _WaveNet):
+            return False
+        return self._net._net.is_slimmable() and (
+            self._optimizer_small_config is not None
+            or self._freeze_small_config is not None
+        )
 
     @classmethod
     def init_from_config(cls, config):
@@ -258,12 +304,22 @@ class LightningModule(_pl.LightningModule, _InitializableFromConfig):
             name=net_config["name"], kwargs={"config": net_config["config"]}
         )
         loss_config = LossConfig.init_from_config(config.get("loss", {}))
-        return {
+        result = {
             "net": net,
             "optimizer_config": config["optimizer"],
             "scheduler_config": config["lr_scheduler"],
             "loss_config": loss_config,
         }
+        if "optimizer_small" in config:
+            result["optimizer_small_config"] = config["optimizer_small"]
+        if "freeze_small" in config:
+            val = config["freeze_small"]
+            # Accept a plain int as shorthand for {"after_epoch": N}
+            if isinstance(val, int):
+                result["freeze_small"] = {"after_epoch": val}
+            else:
+                result["freeze_small"] = val
+        return result
 
     @classmethod
     def register_net_initializer(cls, name, constructor, overwrite: bool = False):
@@ -275,6 +331,9 @@ class LightningModule(_pl.LightningModule, _InitializableFromConfig):
         return self._net
 
     def configure_optimizers(self):
+        if self._dual_optimizer:
+            return self._configure_dual_optimizers()
+
         optimizer = _torch.optim.Adam(self.parameters(), **self._optimizer_config)
         if self._scheduler_config is None:
             return optimizer
@@ -287,6 +346,29 @@ class LightningModule(_pl.LightningModule, _InitializableFromConfig):
                 if key in self._scheduler_config:
                     lr_scheduler_config[key] = self._scheduler_config[key]
             return {"optimizer": optimizer, "lr_scheduler": lr_scheduler_config}
+
+    def _configure_dual_optimizers(self):
+        small_config = (
+            self._optimizer_small_config
+            if self._optimizer_small_config is not None
+            else self._optimizer_config
+        )
+        opt_small = _torch.optim.Adam(self.parameters(), **small_config)
+        opt_large = _torch.optim.Adam(self.parameters(), **self._optimizer_config)
+
+        optimizers = [opt_small, opt_large]
+        schedulers = []
+
+        if self._scheduler_config is not None:
+            for opt in optimizers:
+                lr_scheduler = getattr(
+                    _torch.optim.lr_scheduler, self._scheduler_config["class"]
+                )(opt, **self._scheduler_config["kwargs"])
+                schedulers.append(lr_scheduler)
+
+        if schedulers:
+            return optimizers, schedulers
+        return optimizers
 
     def forward(self, *args, **kwargs):
         return self.net(*args, **kwargs)  # TODO deprecate--use self.net() instead.
@@ -314,6 +396,9 @@ class LightningModule(_pl.LightningModule, _InitializableFromConfig):
         return preds, targets, self._get_loss_dict(preds, targets)
 
     def training_step(self, batch, batch_idx):
+        if self._dual_optimizer:
+            return self._dual_optimizer_training_step(batch)
+
         _, _, loss_dict = self._shared_step(batch)
 
         loss = 0.0
@@ -321,6 +406,129 @@ class LightningModule(_pl.LightningModule, _InitializableFromConfig):
             if v.weight is not None and v.weight > 0.0:
                 loss = loss + v.weight * v.value
         return loss
+
+    def _dual_optimizer_training_step(self, batch):
+        opt_small, opt_large = self.optimizers()
+
+        if not self._small_frozen:
+            # Phase 1: Train only the small model
+            self._net._net.set_slimming(0.0)
+            _, _, loss_dict_small = self._shared_step(batch)
+            loss_small = sum(
+                v.weight * v.value
+                for v in loss_dict_small.values()
+                if v.weight is not None and v.weight > 0.0
+            )
+            opt_small.zero_grad()
+            self.manual_backward(loss_small)
+            self._mask_gradients_to_small()
+            opt_small.step()
+            self._net._net.set_slimming(1.0)
+            self.log("train_loss_small", loss_small, prog_bar=True)
+            return loss_small
+        else:
+            # Phase 2: Small is frozen, train only the large model (boosting
+            # detaches the small region's gradients automatically)
+            self._net._net.set_slimming(1.0)
+            _, _, loss_dict_large = self._shared_step(batch)
+            loss_large = sum(
+                v.weight * v.value
+                for v in loss_dict_large.values()
+                if v.weight is not None and v.weight > 0.0
+            )
+            opt_large.zero_grad()
+            self.manual_backward(loss_large)
+            opt_large.step()
+            self.log("train_loss_large", loss_large, prog_bar=True)
+            return loss_large
+
+    def _mask_gradients_to_small(self):
+        """Zero gradients outside the smallest channel slice.
+
+        After the small-model backward pass, only the small region should
+        receive gradient updates. This masks out everything else.
+        """
+        from ..models.wavenet._slimmable_conv import SlimmableConv1dBase
+
+        for module in self._net.modules():
+            if not isinstance(module, SlimmableConv1dBase):
+                continue
+            small_in = module._allowed_in_channels[0]
+            small_out = module._allowed_out_channels[0]
+
+            w = module.weight
+            if w.grad is not None:
+                # Zero grad outside [:small_out, :small_in, :]
+                if small_out < w.shape[0]:
+                    w.grad[small_out:, :, :] = 0.0
+                if small_in < w.shape[1]:
+                    w.grad[:, small_in:, :] = 0.0
+
+            b = module.bias
+            if b is not None and b.grad is not None:
+                if small_out < b.shape[0]:
+                    b.grad[small_out:] = 0.0
+
+    def on_train_epoch_end(self):
+        if not self._dual_optimizer:
+            return
+
+        # Check freeze triggers at end of epoch (before stepping schedulers)
+        if not self._small_frozen:
+            self._check_freeze_small()
+
+        # Only step the active phase's scheduler
+        schedulers = self.lr_schedulers()
+        if schedulers is not None:
+            if not isinstance(schedulers, list):
+                schedulers = [schedulers]
+            if not self._small_frozen:
+                # Phase 1: step small scheduler
+                if len(schedulers) > 0 and schedulers[0] is not None:
+                    schedulers[0].step()
+            else:
+                # Phase 2: step large scheduler
+                if len(schedulers) > 1 and schedulers[1] is not None:
+                    schedulers[1].step()
+
+    def _check_freeze_small(self):
+        """Check if the small model should be frozen this epoch."""
+        # Hard cutoff
+        if (
+            self._freeze_small_after_epoch is not None
+            and self.current_epoch >= self._freeze_small_after_epoch
+        ):
+            self._freeze_small_now()
+            return
+
+        # Patience-based: use the epoch-averaged train_loss_small
+        if self._freeze_small_patience is None:
+            return
+
+        callback_metrics = self.trainer.callback_metrics
+        if "train_loss_small" not in callback_metrics:
+            return
+        current_loss = callback_metrics["train_loss_small"].item()
+
+        if (
+            self._small_best_loss is None
+            or current_loss < self._small_best_loss - self._freeze_small_min_delta
+        ):
+            self._small_best_loss = current_loss
+            self._small_patience_counter = 0
+        else:
+            self._small_patience_counter += 1
+
+        if self._small_patience_counter >= self._freeze_small_patience:
+            self._freeze_small_now()
+
+    def _freeze_small_now(self):
+        self._small_frozen = True
+        self._small_frozen_at_epoch = self.current_epoch
+        logger.info(
+            f"Small model frozen at epoch {self.current_epoch}. "
+            f"Switching to large model training."
+        )
 
     def validation_step(self, batch, batch_idx):
         preds, targets, loss_dict = self._shared_step(batch)

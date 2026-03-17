@@ -55,11 +55,15 @@ def _init_smallest_and_zeros(
     temp.reset_parameters()
     # Copy initialized slice into full-weight tensor
     module.weight.data[:min_out, :min_in, :] = temp.weight.data
-    # Zero the rest (extra output channels, extra input channels)
+    # Zero extra output channels (all their input connections)
     if min_out < module.out_channels:
         module.weight.data[min_out:, :, :] = 0.0
-    if min_in < module.in_channels:
-        module.weight.data[:, min_in:, :] = 0.0
+    # Zero extra input channels ONLY for extra output channels (already covered
+    # above).  Do NOT zero the cross-terms w[:min_out, min_in:, :] — those are
+    # the sole pathway for gradient to flow back into the large model's channels
+    # during boosted Phase-2 training.  Zeroing them creates a deadlock where
+    # both the head_rechannel weights and the head_input activations for large
+    # channels are zero, so neither can ever receive a gradient update.
     if module.bias is not None:
         module.bias.data[:min_out] = temp.bias.data
         module.bias.data[min_out:] = 0.0

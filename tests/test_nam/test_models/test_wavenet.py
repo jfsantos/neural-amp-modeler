@@ -1666,9 +1666,12 @@ class TestSlimmableWaveNet:
             # Extra output channels should be zero
             if min_out < w.shape[0]:
                 assert w[min_out:, :, :].abs().sum().item() == 0.0
-            # Extra input channels should be zero
-            if min_in < w.shape[1]:
-                assert w[:, min_in:, :].abs().sum().item() == 0.0
+            # Cross-terms (small output x large input) keep standard init for
+            # gradient flow in boosted Phase-2 training
+            if min_in < w.shape[1] and min_out < w.shape[0]:
+                # Extra-output rows already zeroed above; cross-terms are NOT zero
+                cross = w[:min_out, min_in:, :]
+                assert cross.abs().sum().item() > 0.0
             # Bias: smallest slice non-zero (if bias exists), rest zero
             if conv.bias is not None:
                 assert conv.bias[:min_out].abs().sum().item() > 0.0
@@ -1704,7 +1707,8 @@ class TestSlimmableWaveNet:
         w = layer.weight
         assert w[:min_out, :min_in, :].abs().sum().item() > 0.0
         assert w[min_out:, :, :].abs().sum().item() == 0.0
-        assert w[:, min_in:, :].abs().sum().item() == 0.0
+        # Cross-terms keep standard init for gradient flow
+        assert w[:min_out, min_in:, :].abs().sum().item() > 0.0
         if layer.bias is not None:
             assert layer.bias[:min_out].abs().sum().item() > 0.0
             assert layer.bias[min_out:].abs().sum().item() == 0.0

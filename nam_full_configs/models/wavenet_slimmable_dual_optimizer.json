@@ -1,7 +1,11 @@
 {
     "_notes": [
-        "Slimmable WaveNet: channel-slicing training. No head 1x1, FiLM, condition_dsp, or groups > 1.",
-        "Optional: 'optimizer_small' for separate small-model optimizer, 'freeze_small' for phased training."
+        "Slimmable WaveNet with phased dual-optimizer training.",
+        "Phase 1: train only the small model until its loss plateaus.",
+        "Phase 2: freeze small model, train only the large model.",
+        "freeze_small.patience: epochs without improvement before freezing.",
+        "freeze_small.after_epoch: hard cutoff (whichever triggers first).",
+        "optimizer_small: separate optimizer for the small model phase."
     ],
     "net": {
         "name": "WaveNet",
@@ -51,6 +55,10 @@
     "optimizer": {
         "lr": 0.004
     },
+    "optimizer_small": {
+        "lr": 0.002
+    },
+    "freeze_small": 100,
     "lr_scheduler": {
         "class": "ExponentialLR",
         "kwargs": {
