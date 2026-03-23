@@ -1,0 +1,38 @@
+{
+    "net": {
+        "name": "WienerHammerstein",
+        "config": {
+            "stages": [
+                {
+                    "filter_length": 64,
+                    "hidden_sizes": [8, 8],
+                    "activation": "Tanh",
+                    "context": 1
+                },
+                {
+                    "filter_length": 32,
+                    "hidden_sizes": [8, 8],
+                    "activation": "Tanh",
+                    "context": 1
+                },
+                {
+                    "filter_length": 32,
+                    "hidden_sizes": [8, 8],
+                    "activation": "Tanh",
+                    "context": 1
+                }
+            ],
+            "post_filter_length": 512
+        }
+    },
+    "optimizer": {
+        "lr": 0.004,
+        "weight_decay": 1e-07
+    },
+    "lr_scheduler": {
+        "class": "ExponentialLR",
+        "kwargs": {
+            "gamma": 0.993
+        }
+    }
+}

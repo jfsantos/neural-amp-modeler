@@ -18,6 +18,7 @@ from .base import BaseNet as _BaseNet
 from .linear import Linear as _Linear
 from .recurrent import LSTM as _LSTM
 from .wavenet import WaveNet as _WaveNet
+from .wiener_hammerstein import WienerHammerstein as _WienerHammerstein
 
 
 def _init_linear(config, sample_rate: _Optional[float]) -> _Linear:
@@ -138,6 +139,12 @@ def _init_wavenet(config, sample_rate: _Optional[float]) -> _WaveNet:
     return _WaveNet.init_from_config(full_config)
 
 
+def _init_wiener_hammerstein(
+    config, sample_rate: _Optional[float]
+) -> _WienerHammerstein:
+    return _WienerHammerstein.init_from_config({**config, "sample_rate": sample_rate})
+
+
 def init_from_nam(config) -> _BaseNet:
     """
     Taking the contents of a .nam file, initialize a model
@@ -148,8 +155,13 @@ def init_from_nam(config) -> _BaseNet:
     ...     model = init_from_nam(config)
     """
     # NB: Some old .nam files don't have a sample_rate. Must .get()
-    model = {"Linear": _init_linear, "WaveNet": _init_wavenet, "LSTM": _init_lstm}[
-        config["architecture"]
-    ](config=config["config"], sample_rate=config.get("sample_rate", None))
+    model = {
+        "Linear": _init_linear,
+        "WaveNet": _init_wavenet,
+        "LSTM": _init_lstm,
+        "WienerHammerstein": _init_wiener_hammerstein,
+    }[config["architecture"]](
+        config=config["config"], sample_rate=config.get("sample_rate", None)
+    )
     model.import_weights(_torch.Tensor(config["weights"]))
     return model
