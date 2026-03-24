@@ -430,6 +430,82 @@ def get_qat_scales_from_state_dict(
     return {"per_layer_act_scale": per_layer, "buf_scale": buf_list}
 
 
+def profile_act_scales(
+    model,
+    dataloader,
+    num_batches: int = 10,
+) -> List[float]:
+    """Profile per-layer activation scales by running inference on real data.
+
+    Measures the maximum absolute activation value at each layer's post-activation
+    point, providing good initial scales for QAT fake quantization.
+
+    :param model: A LightningModule / WaveNet / _WaveNet instance.
+    :param dataloader: A DataLoader yielding (input, target) batches.
+    :param num_batches: Number of batches to profile over.
+    :returns: Flat list of per-layer activation scales (one per layer across
+        all layer arrays).
+    """
+    inner = model
+    while hasattr(inner, "_net") and not hasattr(inner, "_layer_arrays"):
+        inner = inner._net
+
+    if not hasattr(inner, "_layer_arrays"):
+        raise TypeError(
+            f"Expected a WaveNet model with _layer_arrays, got {type(inner)}"
+        )
+
+    # Register hooks to capture post-activation max abs values
+    max_abs: dict = {}  # (la_idx, l_idx) -> running max
+    hooks = []
+
+    for la_idx, la in enumerate(inner._layer_arrays):
+        for l_idx, layer in enumerate(la._layers):
+            key = (la_idx, l_idx)
+            max_abs[key] = 0.0
+
+            def _make_hook(k):
+                def hook(module, input, output):
+                    # output is (residual, head_output); we want post-activation
+                    # which flows into head_output before layer1x1
+                    # Use the head_output as proxy for post-activation magnitude
+                    _, head_out = output
+                    val = head_out.detach().abs().max().item()
+                    max_abs[k] = max(max_abs[k], val)
+                return hook
+
+            hooks.append(layer.register_forward_hook(_make_hook(key)))
+
+    # Run inference
+    device = next(inner.parameters()).device
+    was_training = inner.training
+    inner.eval()
+    with torch.no_grad():
+        for i, batch in enumerate(dataloader):
+            if i >= num_batches:
+                break
+            x, y = batch
+            x = x.to(device)
+            model(x)
+
+    if was_training:
+        inner.train()
+
+    # Clean up hooks
+    for h in hooks:
+        h.remove()
+
+    # Build flat scale list
+    scales = []
+    for la_idx, la in enumerate(inner._layer_arrays):
+        for l_idx in range(len(la._layers)):
+            val = max_abs[(la_idx, l_idx)]
+            # Use a small margin (1.1x) to avoid immediate clipping
+            scales.append(max(val * 1.1, 1e-6))
+
+    return scales
+
+
 def get_learned_buf_scales(model) -> List[float]:
     """Extract learned per-layer-array buffer scales (rechannel/residual).
 

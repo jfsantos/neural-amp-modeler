@@ -24,19 +24,23 @@ from nam.data import init_dataset as _init_dataset
 from nam.models.wavenet._qat import (
     enable_qat as _enable_qat,
     get_qat_scales_from_state_dict as _get_qat_scales_from_state_dict,
+    profile_act_scales as _profile_act_scales,
 )
 
 
 class _QATCallback(_pl.Callback):
     """Enables QAT after a warmup period of float-only training."""
 
-    def __init__(self, qat_config: dict):
+    def __init__(self, qat_config: dict, train_dataloader):
         self.qat_config = qat_config
         self.start_epoch = qat_config.get("start_epoch", 100)
+        self._train_dataloader = train_dataloader
         self._enabled = False
+        self.best_qat_checkpoint: _Optional[str] = None
 
     def on_train_epoch_start(self, trainer, pl_module):
         if not self._enabled and trainer.current_epoch >= self.start_epoch:
+            # Profile activation scales from real data if not provided
             act_scales = self.qat_config.get("act_scales")
             if isinstance(act_scales, str):
                 import json
@@ -44,6 +48,15 @@ class _QATCallback(_pl.Callback):
                 with open(act_scales) as f:
                     profile = json.load(f)
                 act_scales = profile.get("per_layer_act_scale", [])
+            elif act_scales is None:
+                print("Profiling activation scales from training data...")
+                act_scales = _profile_act_scales(
+                    pl_module,
+                    self._train_dataloader,
+                    num_batches=self.qat_config.get("profile_batches", 10),
+                )
+                print(f"  Profiled scales: {act_scales}")
+
             _enable_qat(
                 pl_module,
                 act_scales=act_scales,
@@ -51,17 +64,53 @@ class _QATCallback(_pl.Callback):
                 q_max=self.qat_config.get("q_max", 32767),
                 learnable_scales=self.qat_config.get("learnable_scales", True),
             )
-            # Add the new QAT parameters to the optimizer
+
+            # Lower LR to 10% of peak for all existing param groups
+            optimizer = trainer.optimizers[0]
+            lr_fraction = self.qat_config.get("lr_fraction", 0.1)
+            peak_lr = optimizer.defaults["lr"]
+            qat_lr = peak_lr * lr_fraction
+            for pg in optimizer.param_groups:
+                pg["lr"] = qat_lr
+            print(
+                f"QAT LR set to {lr_fraction:.0%} of peak "
+                f"({peak_lr:.2e} -> {qat_lr:.2e})"
+            )
+
+            # Add the new QAT scale parameters to the optimizer
             qat_params = [
                 p
                 for n, p in pl_module.named_parameters()
                 if "._qat_" in n and p.requires_grad
             ]
             if qat_params:
-                optimizer = trainer.optimizers[0]
-                optimizer.add_param_group({"params": qat_params})
+                optimizer.add_param_group({"params": qat_params, "lr": qat_lr})
+
             self._enabled = True
+            self._best_val_loss = float("inf")
             print(f"QAT enabled at epoch {trainer.current_epoch}")
+
+    def on_validation_end(self, trainer, pl_module):
+        """Save the best QAT checkpoint explicitly.
+
+        The main ModelCheckpoint tracks the global best val_loss, which is
+        almost always from before QAT (since QAT raises the loss).  We need
+        our own checkpoint that captures the best *QAT* epoch.
+        """
+        if not self._enabled:
+            return
+        current_val_loss = trainer.callback_metrics.get("val_loss")
+        if current_val_loss is not None and current_val_loss < self._best_val_loss:
+            self._best_val_loss = current_val_loss.item()
+            ckpt_path = str(
+                _Path(trainer.default_root_dir) / "qat_best.ckpt"
+            )
+            trainer.save_checkpoint(ckpt_path)
+            self.best_qat_checkpoint = ckpt_path
+            print(
+                f"Saved best QAT checkpoint "
+                f"(val_loss={self._best_val_loss:.6f}): {ckpt_path}"
+            )
 from nam.train import lightning_module as _lightning_module
 from nam.util import filter_warnings as _filter_warnings
 
@@ -222,7 +271,7 @@ def main(
 
     callbacks = _create_callbacks(learning_config)
     if qat_config is not None:
-        callbacks.append(_QATCallback(qat_config))
+        callbacks.append(_QATCallback(qat_config, train_dataloader))
     trainer = _pl.Trainer(
         callbacks=callbacks,
         default_root_dir=outdir,
@@ -241,8 +290,19 @@ def main(
         print("\nTraining interrupted by user.")
     finally:
         # Always try to export a model, even if training was interrupted
-        # Go to best checkpoint
+        # Go to best checkpoint.
+        # If QAT was enabled, prefer the best checkpoint saved *after* QAT
+        # started, since the overall best may predate QAT and lack scales.
         best_checkpoint = trainer.checkpoint_callback.best_model_path
+        qat_callback = next(
+            (c for c in trainer.callbacks if isinstance(c, _QATCallback)), None
+        )
+        if (
+            qat_callback is not None
+            and qat_callback.best_qat_checkpoint is not None
+        ):
+            best_checkpoint = qat_callback.best_qat_checkpoint
+            print(f"Using best QAT checkpoint: {best_checkpoint}")
         qat_scales = None
         if best_checkpoint != "":
             ckpt = _torch.load(
