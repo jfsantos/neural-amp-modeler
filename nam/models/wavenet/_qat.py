@@ -77,15 +77,16 @@ def _fake_quantize_activation(
 ) -> torch.Tensor:
     """Fake quantize activations: quantize then dequantize with STE.
 
-    Simulates: q = clamp(round(x / scale), -q_max, q_max)
-               x_hat = q * scale / q_max
+    Simulates the C code's nam_f2q15():
+        q = clamp(round(x * q_max / scale), -q_max, q_max)
+        x_hat = q * scale / q_max
 
     STE is applied only to round() (zero gradient replaced by identity).
     clamp() keeps its real gradient (1 inside, 0 outside) so the scale
     parameter receives a meaningful gradient: it learns to widen the range
     where activations would clip, or tighten it to improve resolution.
     """
-    x_scaled = x / scale
+    x_scaled = x * q_max / scale
     # STE: straight-through only for round()
     x_rounded = x_scaled + (torch.round(x_scaled) - x_scaled).detach()
     # clamp keeps its gradient (0 where clipped, 1 otherwise)
@@ -133,10 +134,13 @@ def _conv_with_fake_weight(
 def _qat_layer_forward(self, x, h, out_length):
     """Replacement forward for _Layer with QAT fake quantization.
 
-    Matches the original _Layer.forward() but inserts:
-    - Fake weight quantization on conv and layer1x1
-    - Fake activation quantization after activation (accumulator -> Q15)
-    - Fake saturation on residual (SSAT16 on Q15 layer_buf)
+    Matches the nam2c Q15 pipeline order:
+    1. Conv (fake-quantized weights) + mixin → accumulator
+    2. Fake-quantize accumulator → Q15 at per_layer_scale
+    3. Activation on quantized value (matches C: activate after quantize)
+    4. Head output from activated Q15 value
+    5. L1x1 (fake-quantized weights) → fake-quantize output → Q15 at buf_scale
+    6. Residual = saturate(layer_buf + l1x1_q15)
     """
 
     def _c(t_len, tensor=h):
@@ -164,22 +168,35 @@ def _qat_layer_forward(self, x, h, out_length):
     if self._input_mixin_post_film is not None:
         mix_out = self._input_mixin_post_film(mix_out, _c(mix_out.shape[2]))
 
-    # Step 3: Add + activation
+    # Step 3: Accumulator
     z1len = min(zconv.shape[2], mix_out.shape[2])
     z1 = zconv[:, :, -z1len:] + mix_out[:, :, -z1len:]
     if self._activation_pre_film is not None:
         z1 = self._activation_pre_film(z1, _c(z1.shape[2]))
 
+    # ** QAT: fake quantize accumulator BEFORE activation (matches C:
+    #    _cq = nam_f2q15_round(accum * accum_to_q15), then activate) **
+    z1 = self._qat_post_act(z1)
+
+    # Step 4: Activation on quantized value (matches C order)
     post_activation = self._activation(z1)
     if self._activation_post_film is not None:
         post_activation = self._activation_post_film(
             post_activation, _c(post_activation.shape[2])
         )
 
-    # ** QAT: fake quantize post-activation (accumulator -> Q15) **
-    post_activation = self._qat_post_act(post_activation)
+    # Step 5: Head output from activated Q15 value
+    head_output = post_activation
+    if self._head1x1 is not None:
+        head_output = self._head1x1(head_output)[:, :, -out_length:]
+        if self._head1x1_post_film is not None:
+            head_output = self._head1x1_post_film(
+                head_output, _c(head_output.shape[2])
+            )
+    else:
+        head_output = head_output[:, :, -out_length:]
 
-    # Step 4: layer1x1 + residual
+    # Step 6: layer1x1 + residual
     layer_output = post_activation
     if self._layer1x1 is not None:
         # ** QAT: fake quantize layer1x1 weights **
@@ -190,17 +207,9 @@ def _qat_layer_forward(self, x, h, out_length):
             layer_output = self._layer1x1_post_film(
                 layer_output, _c(layer_output.shape[2])
             )
-
-    # Head output (no QAT needed - head path stays float)
-    head_output = post_activation
-    if self._head1x1 is not None:
-        head_output = self._head1x1(head_output)[:, :, -out_length:]
-        if self._head1x1_post_film is not None:
-            head_output = self._head1x1_post_film(
-                head_output, _c(head_output.shape[2])
-            )
-    else:
-        head_output = head_output[:, :, -out_length:]
+        # ** QAT: fake quantize l1x1 output → Q15 at buf_scale
+        #    (matches C: _l1q = nam_f2q15_round(accum * l1x1_to_q15)) **
+        layer_output = self._qat_l1x1_out(layer_output)
 
     residual = x[:, :, -layer_output.shape[2] :] + layer_output
 
@@ -304,13 +313,23 @@ def enable_qat(
                 layer_scale = default_act_scale
             scale_idx += 1
 
-            # Post-activation fake quantize (accumulator -> Q15)
+            # Pre-activation fake quantize (accumulator -> Q15 at per_layer_scale)
+            # Matches C: _cq = nam_f2q15_round(accum * accum_to_q15)
             fq_post_act = FakeQuantizeQ15(
                 initial_scale=layer_scale,
                 q_max=q_max,
                 learnable=learnable_scales,
             )
             layer.add_module("_qat_post_act", fq_post_act)
+
+            # L1x1 output fake quantize (l1x1 accum -> Q15 at buf_scale)
+            # Matches C: _l1q = nam_f2q15_round(accum * l1x1_to_q15)
+            fq_l1x1_out = FakeQuantizeQ15(
+                initial_scale=rechannel_scale,
+                q_max=q_max,
+                learnable=learnable_scales,
+            )
+            layer.add_module("_qat_l1x1_out", fq_l1x1_out)
 
             # Residual fake quantize (SSAT16 saturation on Q15 layer_buf)
             # Uses the buf_scale (max across layer array) for the residual path
@@ -357,7 +376,7 @@ def disable_qat(model):
                 del layer._qat_orig_forward
             if hasattr(layer, "_qat_q_max"):
                 del layer._qat_q_max
-            for attr in ("_qat_post_act", "_qat_residual"):
+            for attr in ("_qat_post_act", "_qat_l1x1_out", "_qat_residual"):
                 if hasattr(layer, attr):
                     delattr(layer, attr)
 
@@ -504,6 +523,75 @@ def profile_act_scales(
             scales.append(max(val * 1.1, 1e-6))
 
     return scales
+
+
+class ActivationRangeCollector(nn.Module):
+    """Accumulates a penalty on large activations at quantization boundaries.
+
+    Registers forward hooks on each WaveNet layer.  Instead of collecting
+    per-layer tensors into a Python list (slow: many small tensors, a
+    ``torch.stack``, and extra memory), each hook computes its contribution
+    to the penalty *in-place* and adds it to a running scalar.  This avoids
+    intermediate ``abs()`` allocations and the final ``stack``/``mean``.
+
+    Call :meth:`get_loss` after the forward pass (returns the accumulated
+    scalar), then :meth:`reset` before the next batch.
+
+    Active from epoch 0 so the model learns bounded activations before QAT.
+    """
+
+    def __init__(self, model):
+        super().__init__()
+        inner = model
+        while hasattr(inner, "_net") and not hasattr(inner, "_layer_arrays"):
+            inner = inner._net
+
+        if not hasattr(inner, "_layer_arrays"):
+            raise TypeError(
+                f"Expected a WaveNet model with _layer_arrays, got {type(inner)}"
+            )
+
+        self._penalty_sum: Optional[torch.Tensor] = None
+        self._n_terms: int = 0
+        self._hooks = []
+
+        for la in inner._layer_arrays:
+            for layer in la._layers:
+                self._hooks.append(
+                    layer.register_forward_hook(self._hook)
+                )
+
+    def _hook(self, module, input, output):
+        residual, head_output = output
+        # amax avoids materializing a full-size .abs() tensor — it
+        # computes max(|x|) in a single fused kernel.
+        for t in (head_output, residual):
+            peak = torch.amax(t.abs(), dim=(0, 1, 2))
+            excess = peak - 1.0
+            if excess > 0:
+                penalty = excess * excess
+                if self._penalty_sum is None:
+                    self._penalty_sum = penalty
+                else:
+                    self._penalty_sum = self._penalty_sum + penalty
+        self._n_terms += 2
+
+    def get_loss(self) -> torch.Tensor:
+        """Return mean soft-hinge penalty accumulated during the forward pass."""
+        if self._penalty_sum is None or self._n_terms == 0:
+            return torch.tensor(0.0)
+        return self._penalty_sum / self._n_terms
+
+    def reset(self):
+        """Clear the running sum for the next forward pass."""
+        self._penalty_sum = None
+        self._n_terms = 0
+
+    def remove_hooks(self):
+        """Remove all forward hooks."""
+        for h in self._hooks:
+            h.remove()
+        self._hooks.clear()
 
 
 def get_learned_buf_scales(model) -> List[float]:

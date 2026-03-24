@@ -22,6 +22,7 @@ from nam.data import ConcatDataset as _ConcatDataset
 from nam.data import Split as _Split
 from nam.data import init_dataset as _init_dataset
 from nam.models.wavenet._qat import (
+    ActivationRangeCollector as _ActivationRangeCollector,
     enable_qat as _enable_qat,
     get_qat_scales_from_state_dict as _get_qat_scales_from_state_dict,
     profile_act_scales as _profile_act_scales,
@@ -111,6 +112,39 @@ class _QATCallback(_pl.Callback):
                 f"Saved best QAT checkpoint "
                 f"(val_loss={self._best_val_loss:.6f}): {ckpt_path}"
             )
+class _ActivationRangeCallback(_pl.Callback):
+    """Penalizes large activation magnitudes at quantization boundary points.
+
+    Active from epoch 0 so the model learns bounded activations before QAT
+    starts.  Uses forward hooks on each WaveNet layer to measure max absolute
+    values of post-activation and residual outputs, then adds a soft-hinge
+    penalty (zero for values <= 1.0, quadratic above) to the training loss.
+    """
+
+    def __init__(self, weight: float = 0.1):
+        self._weight = weight
+        self._collector: _Optional[_ActivationRangeCollector] = None
+
+    def on_train_start(self, trainer, pl_module):
+        self._collector = _ActivationRangeCollector(pl_module)
+        orig_training_step = pl_module.training_step
+        collector = self._collector
+        weight = self._weight
+
+        def _training_step_with_range_loss(batch, batch_idx):
+            collector.reset()
+            loss = orig_training_step(batch, batch_idx)
+            range_loss = collector.get_loss()
+            return loss + weight * range_loss
+
+        pl_module.training_step = _training_step_with_range_loss
+        print(f"Activation range regularization active (weight={weight})")
+
+    def on_train_end(self, trainer, pl_module):
+        if self._collector is not None:
+            self._collector.remove_hooks()
+
+
 from nam.train import lightning_module as _lightning_module
 from nam.util import filter_warnings as _filter_warnings
 
@@ -271,6 +305,9 @@ def main(
 
     callbacks = _create_callbacks(learning_config)
     if qat_config is not None:
+        range_weight = qat_config.get("range_loss_weight", 0.1)
+        if range_weight > 0:
+            callbacks.append(_ActivationRangeCallback(weight=range_weight))
         callbacks.append(_QATCallback(qat_config, train_dataloader))
     trainer = _pl.Trainer(
         callbacks=callbacks,
