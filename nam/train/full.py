@@ -21,6 +21,10 @@ from torch.utils.data import DataLoader as _DataLoader
 from nam.data import ConcatDataset as _ConcatDataset
 from nam.data import Split as _Split
 from nam.data import init_dataset as _init_dataset
+from nam.models.wavenet._qat import (
+    enable_qat as _enable_qat,
+    get_qat_scales_from_state_dict as _get_qat_scales_from_state_dict,
+)
 from nam.train import lightning_module as _lightning_module
 from nam.util import filter_warnings as _filter_warnings
 
@@ -166,6 +170,24 @@ def main(
         )
     model.net.sample_rate = dataset_train.sample_rate
 
+    # Enable QAT if configured
+    qat_config = learning_config.get("qat")
+    if qat_config is not None:
+        act_scales = qat_config.get("act_scales")
+        # Load act_scales from a profile JSON if a path is given
+        if isinstance(act_scales, str):
+            with open(act_scales) as f:
+                profile = _json.load(f)
+            act_scales = profile.get("per_layer_act_scale", [])
+        _enable_qat(
+            model,
+            act_scales=act_scales,
+            default_act_scale=qat_config.get("default_act_scale", 1.0),
+            q_max=qat_config.get("q_max", 32767),
+            learnable_scales=qat_config.get("learnable_scales", True),
+        )
+        print("QAT enabled")
+
     # Perform handshakes:
     dataset_train.handshake(model.net)
     dataset_validation.handshake(model.net)
@@ -197,6 +219,13 @@ def main(
         # Always try to export a model, even if training was interrupted
         # Go to best checkpoint
         best_checkpoint = trainer.checkpoint_callback.best_model_path
+        # Extract learned QAT scales from the best checkpoint before
+        # loading the model without QAT for rendering/export.
+        qat_scales = None
+        if best_checkpoint != "" and qat_config is not None:
+            ckpt = _torch.load(best_checkpoint, map_location="cpu", weights_only=True)
+            qat_scales = _get_qat_scales_from_state_dict(ckpt["state_dict"])
+            del ckpt
         if best_checkpoint != "":
             model = _lightning_module.LightningModule.load_from_checkpoint(
                 trainer.checkpoint_callback.best_model_path,
@@ -204,6 +233,7 @@ def main(
             )
         model.cpu()
         model.eval()
+
         if make_plots:
             _plot(
                 model,
@@ -216,6 +246,18 @@ def main(
             _plot(model, dataset_validation, show=not no_show)
         # Export!
         model.net.export(outdir)
+
+        # Inject learned QAT scales into the exported .nam file
+        if qat_scales is not None:
+            nam_path = _Path(outdir, f"model{model.net.FILE_EXTENSION}")
+            with open(nam_path) as f:
+                nam_dict = _json.load(f)
+            nam_dict["qat"] = qat_scales
+            with open(nam_path, "w") as f:
+                _json.dump(nam_dict, f)
+            print(f"QAT scales written to {nam_path}")
+            print(f"  per_layer_act_scale: {qat_scales['per_layer_act_scale']}")
+            print(f"  buf_scale: {qat_scales['buf_scale']}")
 
         # Tear down the datasets
         train_dataloader.dataset.teardown()
