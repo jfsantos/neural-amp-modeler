@@ -25,6 +25,43 @@ from nam.models.wavenet._qat import (
     enable_qat as _enable_qat,
     get_qat_scales_from_state_dict as _get_qat_scales_from_state_dict,
 )
+
+
+class _QATCallback(_pl.Callback):
+    """Enables QAT after a warmup period of float-only training."""
+
+    def __init__(self, qat_config: dict):
+        self.qat_config = qat_config
+        self.start_epoch = qat_config.get("start_epoch", 100)
+        self._enabled = False
+
+    def on_train_epoch_start(self, trainer, pl_module):
+        if not self._enabled and trainer.current_epoch >= self.start_epoch:
+            act_scales = self.qat_config.get("act_scales")
+            if isinstance(act_scales, str):
+                import json
+
+                with open(act_scales) as f:
+                    profile = json.load(f)
+                act_scales = profile.get("per_layer_act_scale", [])
+            _enable_qat(
+                pl_module,
+                act_scales=act_scales,
+                default_act_scale=self.qat_config.get("default_act_scale", 1.0),
+                q_max=self.qat_config.get("q_max", 32767),
+                learnable_scales=self.qat_config.get("learnable_scales", True),
+            )
+            # Add the new QAT parameters to the optimizer
+            qat_params = [
+                p
+                for n, p in pl_module.named_parameters()
+                if "._qat_" in n and p.requires_grad
+            ]
+            if qat_params:
+                optimizer = trainer.optimizers[0]
+                optimizer.add_param_group({"params": qat_params})
+            self._enabled = True
+            print(f"QAT enabled at epoch {trainer.current_epoch}")
 from nam.train import lightning_module as _lightning_module
 from nam.util import filter_warnings as _filter_warnings
 
@@ -170,23 +207,7 @@ def main(
         )
     model.net.sample_rate = dataset_train.sample_rate
 
-    # Enable QAT if configured
     qat_config = learning_config.get("qat")
-    if qat_config is not None:
-        act_scales = qat_config.get("act_scales")
-        # Load act_scales from a profile JSON if a path is given
-        if isinstance(act_scales, str):
-            with open(act_scales) as f:
-                profile = _json.load(f)
-            act_scales = profile.get("per_layer_act_scale", [])
-        _enable_qat(
-            model,
-            act_scales=act_scales,
-            default_act_scale=qat_config.get("default_act_scale", 1.0),
-            q_max=qat_config.get("q_max", 32767),
-            learnable_scales=qat_config.get("learnable_scales", True),
-        )
-        print("QAT enabled")
 
     # Perform handshakes:
     dataset_train.handshake(model.net)
@@ -199,8 +220,11 @@ def main(
         dataset_validation, **learning_config["val_dataloader"]
     )
 
+    callbacks = _create_callbacks(learning_config)
+    if qat_config is not None:
+        callbacks.append(_QATCallback(qat_config))
     trainer = _pl.Trainer(
-        callbacks=_create_callbacks(learning_config),
+        callbacks=callbacks,
         default_root_dir=outdir,
         **learning_config["trainer"],
     )
@@ -219,18 +243,26 @@ def main(
         # Always try to export a model, even if training was interrupted
         # Go to best checkpoint
         best_checkpoint = trainer.checkpoint_callback.best_model_path
-        # Extract learned QAT scales from the best checkpoint before
-        # loading the model without QAT for rendering/export.
         qat_scales = None
-        if best_checkpoint != "" and qat_config is not None:
-            ckpt = _torch.load(best_checkpoint, map_location="cpu", weights_only=True)
-            qat_scales = _get_qat_scales_from_state_dict(ckpt["state_dict"])
-            del ckpt
         if best_checkpoint != "":
-            model = _lightning_module.LightningModule.load_from_checkpoint(
-                trainer.checkpoint_callback.best_model_path,
-                **_lightning_module.LightningModule.parse_config(model_config),
+            ckpt = _torch.load(
+                best_checkpoint, map_location="cpu", weights_only=True
             )
+            qat_scales = _get_qat_scales_from_state_dict(ckpt["state_dict"])
+            # Strip QAT keys so the base model can load cleanly
+            # (may be absent if training stopped before QAT started)
+            state_dict = {
+                k: v
+                for k, v in ckpt["state_dict"].items()
+                if "._qat_" not in k
+            }
+            parsed = _lightning_module.LightningModule.parse_config(model_config)
+            model = _lightning_module.LightningModule(**parsed)
+            model.load_state_dict(state_dict, strict=True)
+            model.net.sample_rate = ckpt.get(
+                "sample_rate", model.net.sample_rate
+            )
+            del ckpt
         model.cpu()
         model.eval()
 

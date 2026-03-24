@@ -77,14 +77,20 @@ def _fake_quantize_activation(
 ) -> torch.Tensor:
     """Fake quantize activations: quantize then dequantize with STE.
 
-    Simulates: q = clamp(round(x / scale * q_max), -q_max, q_max)
+    Simulates: q = clamp(round(x / scale), -q_max, q_max)
                x_hat = q * scale / q_max
+
+    STE is applied only to round() (zero gradient replaced by identity).
+    clamp() keeps its real gradient (1 inside, 0 outside) so the scale
+    parameter receives a meaningful gradient: it learns to widen the range
+    where activations would clip, or tighten it to improve resolution.
     """
-    inv_scale = float(q_max) / scale
-    x_q = torch.clamp(torch.round(x * inv_scale), -q_max, q_max)
-    x_hat = x_q / inv_scale
-    # STE: forward uses x_hat, backward uses gradient of x
-    return x + (x_hat - x).detach()
+    x_scaled = x / scale
+    # STE: straight-through only for round()
+    x_rounded = x_scaled + (torch.round(x_scaled) - x_scaled).detach()
+    # clamp keeps its gradient (0 where clipped, 1 otherwise)
+    x_q = torch.clamp(x_rounded, -q_max, q_max)
+    return x_q * scale / float(q_max)
 
 
 def _fake_quantize_weight(
