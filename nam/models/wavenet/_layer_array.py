@@ -19,6 +19,9 @@ from . import _conv
 from ._conv import InputMixer as _InputMixer
 from ._conv import class_set as _basic_class_set
 from ._film import FiLM as _FiLM
+from ._antialiasing import AliasFreeActivation as _AliasFreeActivation
+from ._antialiasing import AntiAliasConfig as _AntiAliasConfig
+from ._antialiasing import AntiAliasFilter as _AntiAliasFilter
 from ._slimmable import SLIMMABLE_METHOD as _SLIMMABLE_METHOD
 from ._slimmable import Slimmable as _Slimmable
 from ._slimmable_conv import SlimmableConv1dBase as _SlimmableConv1dBase
@@ -271,6 +274,7 @@ class _Layer(_nn.Module, _InitializableFromConfig, _ImportsWeights):
         activation_post_film: _Optional[_FiLM],
         layer1x1_post_film: _Optional[_FiLM],
         head1x1_post_film: _Optional[_FiLM],
+        residual_antialias: _Optional[_AntiAliasFilter] = None,
     ):
         super().__init__()
         self._conv = conv
@@ -286,6 +290,7 @@ class _Layer(_nn.Module, _InitializableFromConfig, _ImportsWeights):
         self._activation_post_film = activation_post_film
         self._layer1x1_post_film = layer1x1_post_film
         self._head1x1_post_film = head1x1_post_film
+        self._residual_antialias = residual_antialias
 
     @classmethod
     def parse_config(cls, config: _Dict) -> _Dict:
@@ -312,6 +317,12 @@ class _Layer(_nn.Module, _InitializableFromConfig, _ImportsWeights):
         groups_input = config.pop("groups_input", 1)
         groups_input_mixin = config.pop("groups_input_mixin", 1)
         conv_factory_set = config.pop("conv_factory_set")
+        antialiased_activation_config = _AntiAliasConfig.model_validate(
+            config.pop("antialiased_activation", {})
+        )
+        residual_antialias_config = _AntiAliasConfig.model_validate(
+            config.pop("residual_antialias", {})
+        )
 
         # Input mixer takes care of the bias
         mid_channels = (
@@ -409,6 +420,26 @@ class _Layer(_nn.Module, _InitializableFromConfig, _ImportsWeights):
             else None
         )
 
+        # Anti-aliasing: wrap activation if requested
+        if antialiased_activation_config.active:
+            activation = _AliasFreeActivation(
+                activation,
+                bottleneck,
+                filter_size=antialiased_activation_config.filter_size,
+                cutoff=antialiased_activation_config.cutoff,
+            )
+
+        # Anti-aliasing: residual output filter
+        residual_antialias = (
+            _AntiAliasFilter(
+                channels,
+                filter_size=residual_antialias_config.filter_size,
+                cutoff=residual_antialias_config.cutoff,
+            )
+            if residual_antialias_config.active
+            else None
+        )
+
         return dict(
             conv=conv,
             input_mixer=input_mixer,
@@ -423,6 +454,7 @@ class _Layer(_nn.Module, _InitializableFromConfig, _ImportsWeights):
             activation_post_film=activation_post_film,
             layer1x1_post_film=layer1x1_post_film,
             head1x1_post_film=head1x1_post_film,
+            residual_antialias=residual_antialias,
         )
 
     @property
@@ -622,6 +654,8 @@ class _Layer(_nn.Module, _InitializableFromConfig, _ImportsWeights):
             head_output = head_output[:, :, -out_length:]
 
         residual = x[:, :, -layer_output.shape[2] :] + layer_output
+        if self._residual_antialias is not None:
+            residual = self._residual_antialias(residual)
         return (residual, head_output)
 
     def import_weights(self, weights: _Sequence[float], i: int) -> int:
@@ -707,6 +741,8 @@ class LayerArray(_nn.Module, _InitializableFromConfig):
         groups_input = config.pop("groups_input", 1)
         groups_input_mixin = config.pop("groups_input_mixin", 1)
         slimmable_config = config.pop("slimmable", None)
+        antialiased_activation = config.pop("antialiased_activation", {})
+        residual_antialias = config.pop("residual_antialias", {})
 
         head_rechannel_in_channels = (
             head1x1_config.out_channels if head1x1_config.active else bottleneck
@@ -764,6 +800,8 @@ class LayerArray(_nn.Module, _InitializableFromConfig):
                         "groups_input_mixin": groups_input_mixin,
                         "slimmable": slimmable_config,
                         "conv_factory_set": conv_factory_set,
+                        "antialiased_activation": antialiased_activation,
+                        "residual_antialias": residual_antialias,
                     }
                 )
                 for k, d, a in zip(kernel_sizes, dilations, a_list)
