@@ -21,12 +21,12 @@ def sinc_lowpass_kernel(filter_size: int, cutoff: float = 0.45) -> _torch.Tensor
     Generate a windowed sinc lowpass filter kernel.
 
     :param filter_size: Number of taps (should be even for symmetric padding).
-    :param cutoff: Normalized cutoff frequency as a fraction of Nyquist (0, 1).
-        0.45 means 90% of Nyquist.
+    :param cutoff: Normalized cutoff frequency as a fraction of the sampling rate
+        (0, 0.5]. 0.45 means 90% of Nyquist.
     :returns: 1D tensor of shape (filter_size,), normalized to sum to 1.
     """
     assert filter_size >= 1, f"filter_size must be >= 1, got {filter_size}"
-    assert 0.0 < cutoff < 1.0, f"cutoff must be in (0, 1), got {cutoff}"
+    assert 0.0 < cutoff <= 0.5, f"cutoff must be in (0, 0.5], got {cutoff}"
 
     if filter_size == 1:
         return _torch.ones(1)
@@ -34,7 +34,8 @@ def sinc_lowpass_kernel(filter_size: int, cutoff: float = 0.45) -> _torch.Tensor
     # Centered indices
     n = _torch.arange(filter_size, dtype=_torch.float64) - (filter_size - 1) / 2.0
     # Sinc function (normalized: sinc(x) = sin(pi*x) / (pi*x))
-    omega_c = cutoff * _math.pi  # cutoff in radians (relative to Nyquist = pi)
+    # cutoff is fraction of fs; Nyquist = fs/2 = pi in normalized freq
+    omega_c = 2 * cutoff * _math.pi
     sinc = _torch.where(
         n == 0,
         _torch.tensor(omega_c / _math.pi, dtype=_torch.float64),
