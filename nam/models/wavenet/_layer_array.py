@@ -22,6 +22,8 @@ from ._film import FiLM as _FiLM
 from ._antialiasing import AliasFreeActivation as _AliasFreeActivation
 from ._antialiasing import AntiAliasConfig as _AntiAliasConfig
 from ._antialiasing import AntiAliasFilter as _AntiAliasFilter
+from ._upsampled_activation import UpsampledActivation as _UpsampledActivation
+from ._upsampled_activation import UpsampledActivationConfig as _UpsampledActivationConfig
 from ._slimmable import SLIMMABLE_METHOD as _SLIMMABLE_METHOD
 from ._slimmable import Slimmable as _Slimmable
 from ._slimmable_conv import SlimmableConv1dBase as _SlimmableConv1dBase
@@ -275,11 +277,15 @@ class _Layer(_nn.Module, _InitializableFromConfig, _ImportsWeights):
         layer1x1_post_film: _Optional[_FiLM],
         head1x1_post_film: _Optional[_FiLM],
         residual_antialias: _Optional[_AntiAliasFilter] = None,
+        upsampled_activation: _Optional[_UpsampledActivation] = None,
     ):
         super().__init__()
         self._conv = conv
         self._input_mixer = input_mixer
-        self._activation = activation
+        # When upsampled_activation is provided, the activation lives inside it
+        # to avoid dual registration of trainable parameters (e.g. PReLU).
+        self._activation = None if upsampled_activation is not None else activation
+        self._upsampled_activation = upsampled_activation
         self._layer1x1 = layer1x1
         self._head1x1 = head1x1
         self._conv_pre_film = conv_pre_film
@@ -323,6 +329,14 @@ class _Layer(_nn.Module, _InitializableFromConfig, _ImportsWeights):
         residual_antialias_config = _AntiAliasConfig.model_validate(
             config.pop("residual_antialias", {})
         )
+        upsampled_activation_config = _UpsampledActivationConfig.model_validate(
+            config.pop("upsampled_activation", {})
+        )
+        if antialiased_activation_config.active and upsampled_activation_config.active:
+            raise ValueError(
+                "Cannot use both antialiased_activation and upsampled_activation; "
+                "they are mutually exclusive approaches to reducing aliasing"
+            )
 
         # Input mixer takes care of the bias
         mid_channels = (
@@ -429,6 +443,15 @@ class _Layer(_nn.Module, _InitializableFromConfig, _ImportsWeights):
                 cutoff=antialiased_activation_config.cutoff,
             )
 
+        # Upsampled activation: upsample -> activate -> downsample
+        upsampled_activation = (
+            _UpsampledActivation(
+                activation, factor=upsampled_activation_config.factor
+            )
+            if upsampled_activation_config.active
+            else None
+        )
+
         # Anti-aliasing: residual output filter
         residual_antialias = (
             _AntiAliasFilter(
@@ -455,14 +478,23 @@ class _Layer(_nn.Module, _InitializableFromConfig, _ImportsWeights):
             layer1x1_post_film=layer1x1_post_film,
             head1x1_post_film=head1x1_post_film,
             residual_antialias=residual_antialias,
+            upsampled_activation=upsampled_activation,
         )
 
     @property
+    def _effective_activation(self) -> _nn.Module:
+        """The activation module, unwrapping UpsampledActivation if present."""
+        if self._upsampled_activation is not None:
+            return self._upsampled_activation.activation
+        return self._activation
+
+    @property
     def activation_name(self) -> str:
-        if isinstance(self._activation, _PairingActivation):
-            return self._activation.name
+        act = self._effective_activation
+        if isinstance(act, _PairingActivation):
+            return act.name
         else:
-            return self._activation.__class__.__name__
+            return act.__class__.__name__
 
     @property
     def bottleneck(self) -> int:
@@ -471,7 +503,7 @@ class _Layer(_nn.Module, _InitializableFromConfig, _ImportsWeights):
         """
         return (
             self.conv.out_channels // 2
-            if isinstance(self._activation, _PairingActivation)
+            if isinstance(self._effective_activation, _PairingActivation)
             else self.conv.out_channels
         )
 
@@ -516,6 +548,13 @@ class _Layer(_nn.Module, _InitializableFromConfig, _ImportsWeights):
         return self._conv
 
     @property
+    def round_trip_delay(self) -> int:
+        """Extra samples consumed by upsampled activation resampler delay."""
+        if self._upsampled_activation is not None:
+            return self._upsampled_activation.round_trip_delay
+        return 0
+
+    @property
     def dilation(self) -> int:
         return self.conv.dilation[0]
 
@@ -541,14 +580,15 @@ class _Layer(_nn.Module, _InitializableFromConfig, _ImportsWeights):
         Parses the output of _activations.export_activation_config() into primary/
         secondary/gating_mode as expected by the C++ Factory.
         """
-        out = _export_activation_config(self._activation)
-        if isinstance(self._activation, _PairingActivation):
-            if isinstance(self._activation, _PairMultiply):
+        activation = self._effective_activation
+        out = _export_activation_config(activation)
+        if isinstance(activation, _PairingActivation):
+            if isinstance(activation, _PairMultiply):
                 gating_mode = "gated"
-            elif isinstance(self._activation, _PairBlend):
+            elif isinstance(activation, _PairBlend):
                 gating_mode = "blended"
             else:
-                raise ValueError(f"Unknown pairing activation: {self._activation}")
+                raise ValueError(f"Unknown pairing activation: {activation}")
             return {
                 "primary": out["primary"],
                 "gating_mode": gating_mode,
@@ -629,7 +669,11 @@ class _Layer(_nn.Module, _InitializableFromConfig, _ImportsWeights):
         if self._activation_pre_film is not None:
             z1 = self._activation_pre_film(z1, _c(z1.shape[2]))
 
-        post_activation = self._activation(z1)
+        # Apply activation (with optional upsampling around the nonlinearity)
+        if self._upsampled_activation is not None:
+            post_activation = self._upsampled_activation(z1)
+        else:
+            post_activation = self._activation(z1)
         if self._activation_post_film is not None:
             post_activation = self._activation_post_film(
                 post_activation, _c(post_activation.shape[2])
@@ -653,7 +697,15 @@ class _Layer(_nn.Module, _InitializableFromConfig, _ImportsWeights):
         else:
             head_output = head_output[:, :, -out_length:]
 
-        residual = x[:, :, -layer_output.shape[2] :] + layer_output
+        # Residual connection: delay x to compensate for resampler group delay
+        # when upsampled activation is active (matches C++ DelayLine behavior).
+        D = self.round_trip_delay
+        if D > 0:
+            # Prepend D zeros, drop last D samples -> delayed version of x
+            x_delayed = _torch.nn.functional.pad(x, (D, 0))[:, :, : x.shape[2]]
+            residual = x_delayed[:, :, -layer_output.shape[2] :] + layer_output
+        else:
+            residual = x[:, :, -layer_output.shape[2] :] + layer_output
         if self._residual_antialias is not None:
             residual = self._residual_antialias(residual)
         return (residual, head_output)
@@ -743,6 +795,7 @@ class LayerArray(_nn.Module, _InitializableFromConfig):
         slimmable_config = config.pop("slimmable", None)
         antialiased_activation = config.pop("antialiased_activation", {})
         residual_antialias = config.pop("residual_antialias", {})
+        upsampled_activation = config.pop("upsampled_activation", {})
 
         head_rechannel_in_channels = (
             head1x1_config.out_channels if head1x1_config.active else bottleneck
@@ -802,6 +855,7 @@ class LayerArray(_nn.Module, _InitializableFromConfig):
                         "conv_factory_set": conv_factory_set,
                         "antialiased_activation": antialiased_activation,
                         "residual_antialias": residual_antialias,
+                        "upsampled_activation": upsampled_activation,
                     }
                 )
                 for k, d, a in zip(kernel_sizes, dilations, a_list)
@@ -823,6 +877,8 @@ class LayerArray(_nn.Module, _InitializableFromConfig):
         for layer in self._layers:
             assert isinstance(layer, _Layer)
             total += (layer.kernel_size - 1) * layer.dilation
+            # Upsampled activation adds round-trip resampler delay per layer
+            total += layer.round_trip_delay
         return total
 
     def export_config(self):
